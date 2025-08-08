@@ -1,0 +1,60 @@
+# VATSD (Vehicle-Mounted Adaptive Traffic Sign Detector) Model
+# 根据论文 Fig. 1. 结构图编写的 YOLOv8 风格配置文件
+#
+# 注意:
+# 1. DCSP 模块要求输入通道是 3 的倍数，因此在调用前会使用 1x1 Conv 调整通道。
+# 2. 通道数 (width) 和模块重复次数 (depth) 可通过下面的参数调整。
+
+# Parameters
+nc: 232  # number of classes
+depth_multiple: 1.0 # model depth multiple (暂不使用，因为图中结构固定)
+width_multiple: 1.0 # model width multiple (暂不使用，因为通道数手动指定)
+
+# Anchors
+anchors: null
+
+# VATSD Backbone
+backbone:
+  # [from, repeats, module, args]
+  # Stem
+  - [-1, 1, Conv, [63, 3, 2]]          # 0-P1/2, out: 320x320x63. 63是3的倍数
+
+  # Stage 1
+  - [-1, 1, Conv, [129, 3, 2]]         # 1-P2/4, out: 160x160x129. 129是3的倍数
+  - [-1, 1, DCSP, [129, 1]]            # 2, DCSP(1), n=1. 输出通道129. 保存给Neck用
+
+  # Stage 2
+  - [-1, 1, Conv, [255, 3, 2]]         # 3-P3/8, out: 80x80x255. 255是3的倍数
+  - [-1, 1, DCSP, [255, 2]]            # 4, DCSP(2), n=2. 输出通道255. 保存给Neck用
+
+  # Stage 3
+  - [-1, 1, Conv, [513, 3, 2]]         # 5-P4/16, out: 40x40x513. 513是3的倍数
+  - [-1, 1, DCSP, [513, 3]]            # 6, DCSP(3), n=3. 输出通道513. 保存给Neck用
+
+  # Stage 4
+  - [-1, 1, Conv, [513, 3, 2]]         # 7-P5/32, out: 20x20x513.
+  - [-1, 1, DCSP, [513, 1]]            # 8, DCSP(1), n=1.
+  - [-1, 1, SPPF, [513, 5]]            # 9, SPP/SPPF. 输出通道513.
+
+# VATSD Neck (PAN Structure)
+head:
+  # 自顶向下 (FPN)
+  - [-1, 1, nn.Upsample, [null, 2, 'nearest']] # 10, from 9
+  - [[-1, 6], 1, Concat, [1]]          # 11, cat backbone P4 (layer 6)
+  - [-1, 1, DCSP, [513, 0]]            # 12, DCSP(0), n=0. 输出通道513.
+
+  - [-1, 1, nn.Upsample, [null, 2, 'nearest']] # 13, from 12
+  - [[-1, 4], 1, Concat, [1]]          # 14, cat backbone P3 (layer 4)
+  - [-1, 1, DCSP, [255, 0]]            # 15, DCSP(0), n=0. 输出通道255. -> Head1 (large objects)
+
+  # 自底向上 (PAN)
+  - [-1, 1, Conv, [255, 3, 2]]         # 16, from 15, downsample
+  - [[-1, 12], 1, Concat, [1]]         # 17, cat neck P4 (layer 12)
+  - [-1, 1, DCSP, [513, 0]]            # 18, DCSP(0), n=0. 输出通道513. -> Head2 (medium objects)
+
+  - [-1, 1, Conv, [513, 3, 2]]         # 19, from 18, downsample
+  - [[-1, 9], 1, Concat, [1]]          # 20, cat backbone P5 (layer 9)
+  - [-1, 1, DCSP, [513, 0]]            # 21, DCSP(0), n=0. 输出通道513. -> Head3 (small objects)
+
+  # Detect Head
+  - [[15, 18, 21], 1, Detect, [nc]]  # Detect(P3, P4, P5)

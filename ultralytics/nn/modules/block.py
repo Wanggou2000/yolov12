@@ -50,6 +50,7 @@ __all__ = (
     "PSA",
     "SCDown",
     "TorchVision",
+    "DCSP",
 )
 
 
@@ -1367,3 +1368,135 @@ class A2C2f(nn.Module):
         if self.gamma is not None:
             return x + self.gamma.view(1, -1, 1, 1) * self.cv2(torch.cat(y, 1))
         return self.cv2(torch.cat(y, 1))
+
+
+# =================================================================================
+# START: 在 block.py 文件末尾添加以下所有代码，复现VATSD添加的
+# =================================================================================
+
+# ------------------------------------------------------------------
+# 模块1：动态卷积 (Dynamic Convolution)
+# 这是 DCSP 的核心依赖，需要完整添加。
+# ------------------------------------------------------------------
+class DynamicConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, num_convs=4):
+        """
+        初始化动态卷积层。
+        Args:
+            in_channels (int): 输入通道数。
+            out_channels (int): 输出通道数。
+            kernel_size (int): 卷积核大小。
+            num_convs (int): 并行卷积核的数量 (论文中的 K)。
+        """
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.num_convs = num_convs
+
+        # 注意力模块，用于生成每个卷积核的权重
+        self.attn = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels, num_convs),
+            nn.Softmax(dim=-1)
+        )
+
+        # 并行的多个标准卷积层 (注意：这里我们用 nn.Conv2d, 因为权重是动态生成的)
+        self.convs = nn.ModuleList([
+            nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size // 2, bias=False)
+            for _ in range(num_convs)
+        ])
+
+    def forward(self, x):
+        # 1. 计算注意力权重
+        attn_weights = self.attn(x)  # shape: (batch_size, num_convs)
+
+        # 2. 动态加权融合多个卷积核的权重
+        # (B, K) -> (B, K, 1, 1, 1, 1)
+        attn_weights = attn_weights.view(attn_weights.size(0), self.num_convs, 1, 1, 1, 1)
+
+        # (K, out_c, in_c, k, k) -> (1, K, out_c, in_c, k, k)
+        # 将所有卷积核的权重堆叠起来
+        aggregated_weight = torch.stack([conv.weight for conv in self.convs], dim=0).unsqueeze(0)
+
+        # 权重加权: (B, K, ...) * (1, K, ...) -> (B, K, out_c, in_c, k, k)
+        # 然后求和: (B, out_c, in_c, k, k)
+        dynamic_weight = (attn_weights * aggregated_weight).sum(1)
+
+        # 3. 进行动态卷积
+        # 由于每个 batch 样本的卷积核都不同，需要特殊处理
+        # (B, C, H, W) -> (1, B*C, H, W)
+        x = x.view(1, -1, x.size(2), x.size(3))
+        # (B, out_c, in_c, k, k) -> (B*out_c, in_c, k, k)
+        dynamic_weight = dynamic_weight.view(-1, self.in_channels, self.kernel_size, self.kernel_size)
+
+        # 使用分组卷积实现动态卷积，每个样本一组
+        out = F.conv2d(x, dynamic_weight, padding=self.kernel_size // 2, groups=x.size(0))
+
+        # (1, B*out_c, H, W) -> (B, out_c, H, W)
+        out = out.view(attn_weights.size(0), self.out_channels, x.size(2), x.size(3))
+
+        return out
+
+
+# ------------------------------------------------------------------
+# 模块2：DCSP 模块 (严格按照图2(d)和YOLOv8风格实现)
+# ------------------------------------------------------------------
+class DCSP(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        """
+        初始化 DCSP 模块。参数签名与 C3, C2f 等模块保持一致，以方便YAML调用。
+        c1: input channels
+        c2: output channels
+        n: number of ResNet/Bottleneck blocks
+        e: expansion factor (not directly used here but kept for compatibility)
+        """
+        super().__init__()
+        # 确保输入通道可以被3整除以进行分离
+        # 在YAML中配置时需要手动保证 c1 是3的倍数
+        c_ = c1 // 3  # channels per path
+
+        # --- 定义模块 ---
+        # 中间通路 (x''₀)
+        self.dconv = DynamicConv(c_, c_)
+        # 使用YOLOv8的Conv类作为过渡层 (Conv+BN+SiLU)
+        self.bn_relu_dconv = nn.Sequential(nn.BatchNorm2d(c_), nn.SiLU(inplace=True))
+
+        # 左侧与中间融合后的过渡层
+        self.trans_left_mid = Conv(2 * c_, c_, k=1)
+
+        # 右侧通路 (x'''₀)
+        self.trans_right1 = Conv(c_, c_, k=1)
+        self.resnet_blocks = nn.Sequential(
+            *[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)]  # 使用YOLOv8的Bottleneck
+        )
+        self.trans_right2 = Conv(c_, c_, k=1)
+
+        # 最终融合后的过渡层
+        self.trans_final = Conv(2 * c_, c2, k=1)
+
+    def forward(self, x):
+        # 1. Channel Separation
+        c_ = x.shape[1] // 3
+        x_prime, x_double_prime, x_triple_prime = x.split([c_, c_, c_], dim=1)
+
+        # --- 第一阶段融合：处理左侧和中间通路 ---
+        out_dconv = self.bn_relu_dconv(self.dconv(x_double_prime))
+        out_concat1 = torch.cat([x_prime, out_dconv], dim=1)
+        path1_out = self.trans_left_mid(out_concat1)
+
+        # --- 处理右侧通路 ---
+        path2_out = self.trans_right1(x_triple_prime)
+        path2_out = self.resnet_blocks(path2_out)
+        path2_out = self.trans_right2(path2_out)
+
+        # --- 第二阶段融合：融合左右两大路的结果 ---
+        out_concat2 = torch.cat([path1_out, path2_out], dim=1)
+
+        # 经过最后的过渡层得到最终输出
+        return self.trans_final(out_concat2)
+
+# =================================================================================
+# END: 添加代码结束
+# =================================================================================
